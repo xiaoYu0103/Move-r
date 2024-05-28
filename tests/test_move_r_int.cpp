@@ -7,54 +7,50 @@ uint16_t max_num_threads = omp_get_max_threads();
 
 std::lognormal_distribution<double> avg_input_rep_length_distrib(4.0,2.0);
 std::uniform_real_distribution<double> prob_distrib(0.0,1.0);
-std::uniform_int_distribution<uint8_t> alphabet_size_distrib(1,254);
-std::uniform_int_distribution<uint8_t> uchar_distrib(0,255);
 std::uniform_int_distribution<uint32_t> input_size_distrib(1,200000);
 std::uniform_int_distribution<uint16_t> num_threads_distrib(1,max_num_threads);
 std::lognormal_distribution<double> a_distrib(2.0,3.0);
 
 uint32_t input_size;
-uint8_t alphabet_size;
-std::string input;
-std::string input_reverted;
-std::string bwt;
-std::string bwt_retrieved;
-std::vector<uint8_t> map_uchar;
-std::vector<uint8_t> unmap_uchar;
+uint32_t alphabet_size;
+std::vector<int32_t> input;
+std::vector<int32_t> input_libsais;
+std::vector<int32_t> input_reverted;
+std::vector<int32_t> bwt;
+std::vector<int32_t> bwt_retrieved;
 std::vector<int32_t> suffix_array;
-std::vector<int32_t> suffix_array_retrieved;
+std::vector<uint32_t> suffix_array_retrieved;
 uint32_t max_pattern_length;
 uint32_t num_queries;
 
 template <move_r_locate_supp locate_support>
-void test_move_r() {
+void test_move_r_int() {
     // choose a random input length
     input_size = input_size_distrib(gen);
     input.resize(input_size);
 
-    // choose a random alphabet size
-    alphabet_size = alphabet_size_distrib(gen);
-
     // choose a random alphabet
-    std::vector<uint8_t> alphabet;
-    uint8_t uchar;
-    for (uint32_t i=0; i<alphabet_size; i++) {
-        do {uchar = uchar_distrib(gen);} while (contains(alphabet,uchar));
-        alphabet.push_back(uchar);
-    }
+    std::uniform_int_distribution<int32_t> alphabet_size_distrib(1,input_size);
+    alphabet_size = alphabet_size_distrib(gen);
+    std::uniform_int_distribution<int32_t> symbol_distrib(INT_MIN,INT_MAX);
+    std::vector<int32_t> alphabet;
+    for (uint32_t i=0; i<alphabet_size; i++) alphabet.emplace_back(symbol_distrib(gen));
+    ips4o::parallel::sort(alphabet.begin(),alphabet.end());
+    std::unique(alphabet.begin(),alphabet.end());
+    alphabet_size = alphabet.size();
 
     // choose a random input based on the alphabet
-    std::uniform_int_distribution<uint8_t> char_idx_distrib(0,alphabet_size-1);
+    std::uniform_int_distribution<uint32_t> symbol_idx_distrib(0,alphabet_size-1);
     double avg_input_rep_length = 1.0+avg_input_rep_length_distrib(gen);
-    uint8_t cur_uchar = alphabet[char_idx_distrib(gen)];
+    int32_t cur_symbol = alphabet[symbol_idx_distrib(gen)];
     for (uint32_t i=0; i<input_size; i++) {
-        if (prob_distrib(gen) < 1/avg_input_rep_length) cur_uchar = alphabet[char_idx_distrib(gen)];
-        input[i] = uchar_to_char(cur_uchar);
+        if (prob_distrib(gen) < 1/avg_input_rep_length) cur_symbol = alphabet[symbol_idx_distrib(gen)];
+        input[i] = cur_symbol;
     }
 
     // build move-r and choose a random number of threads and balancing parameter, but always use libsais,
     // because there are bugs in Big-BWT that come through during fuzzing but not really in practice
-    move_r<locate_support,char,uint32_t> index(input,{
+    move_r<locate_support,int32_t,uint32_t> index(input,{
         .mode = _libsais,
         .num_threads = num_threads_distrib(gen),
         .a = std::min<uint16_t>(2+a_distrib(gen),32767)
@@ -69,33 +65,20 @@ void test_move_r() {
     #pragma omp parallel for num_threads(max_num_threads)
     for (uint32_t i=0; i<input_size; i++) EXPECT_EQ(input[i],input_reverted[i]);
 
-    // retrieve the suffix array and compare it with the correct suffix array; if the input contains 0,
-    // then temporarily remap the characters of the input string s.t. it does not contain 0
-    if (contains(alphabet,(uint8_t)0)) {
-        map_uchar.resize(256,0);
-        unmap_uchar.resize(256,0);
-        uint8_t next_uchar = 1;
-        for (uint16_t i=0; i<256; i++) {
-            if (contains(alphabet,(uint8_t)i)) {
-                map_uchar[i] = next_uchar;
-                unmap_uchar[next_uchar] = i;
-                next_uchar++;
-            }
-        }
-        for (uint32_t i=0; i<input_size; i++) input[i] = uchar_to_char(map_uchar[char_to_uchar(input[i])]);
-    }
-    input.push_back(uchar_to_char((uint8_t)0));
+    // to build the suffix array, remap the symbols in the input to [1,2,...,alphabet_size]
+    ankerl::unordered_dense::map<int32_t,int32_t> map_int;
+    int32_t sym_cur = 1;
+    for (uint32_t i=0; i<alphabet_size; i++) map_int[alphabet[i]] = sym_cur++;
+    input_libsais.resize(input_size+1);
+    #pragma omp parallel for num_threads(max_num_threads)
+    for (uint32_t i=0; i<input_size; i++) input_libsais[i] = map_int[input[i]];
+    input_libsais[input_size] = 0;
+    // retrieve the suffix array and compare it with the correct suffix array
+    suffix_array.resize(input_size+1+6*(alphabet_size+1));
+    suffix_array[input_size] = 0;
+    libsais_int_omp(&input_libsais[0],&suffix_array[0],input_size+1,alphabet_size+1,6*(alphabet_size+1),max_num_threads);
     suffix_array.resize(input_size+1);
-    libsais_omp((uint8_t*)&input[0],&suffix_array[0],input_size+1,0,NULL,max_num_threads);
-    if (contains(alphabet,(uint8_t)0)) {
-        for (uint32_t i=0; i<input_size; i++) input[i] = uchar_to_char(unmap_uchar[char_to_uchar(input[i])]);
-        map_uchar.clear();
-        unmap_uchar.clear();
-    }
-    suffix_array_retrieved.resize(input_size+1);
-    index.SA([&suffix_array_retrieved](auto i,auto s){suffix_array_retrieved[i] = s;},{
-        .num_threads = num_threads_distrib(gen)
-    });
+    suffix_array_retrieved = index.SA({.num_threads = num_threads_distrib(gen)});
     #pragma omp parallel for num_threads(max_num_threads)
     for (uint32_t i=0; i<=input_size; i++) EXPECT_EQ(suffix_array[i],suffix_array_retrieved[i]);
     
@@ -127,7 +110,7 @@ void test_move_r() {
         std::mt19937 gen_thr(rd());
         uint32_t pattern_pos;
         uint32_t pattern_length;
-        std::string pattern;
+        std::vector<int32_t> pattern;
         std::vector<uint32_t> correct_occurrences;
         std::vector<uint32_t> occurrences;
         bool match;
@@ -160,9 +143,9 @@ TEST(test_move_r,fuzzy_test) {
 
     while (time_diff_min(start_time,now()) < 60) {
         if (prob_distrib(gen) < 0.5) {
-            test_move_r<_phi>();
+            test_move_r_int<_phi>();
         } else {
-            test_move_r<_rlzdsa>();
+            test_move_r_int<_rlzdsa>();
         }
     }
 }
